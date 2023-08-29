@@ -449,7 +449,8 @@ def pytest_configure(config):
     # tools
     for tool in ['isql', 'gbak', 'nbackup', 'gstat', 'gfix', 'gsec', 'fbsvcmgr']:
         set_tool(tool)
-        set_tool(tool, control=True)
+        if control:
+            set_tool(tool, control=True)
     # Load test_config.ini
     QA_GLOBALS.read(_vars_['files'] / 'test_config.ini')
     # Driver encoding for NONE charset
@@ -934,7 +935,10 @@ def db_factory(*, filename: str='test.fdb', init: Optional[str]=None,
 
     @pytest.fixture
     def database_fixture(request: pytest.FixtureRequest, db_path, db_cache) -> Database:
-        srv: ServerManager = request.getfixturevalue(control)
+        if control:
+            srv: ServerManager = request.getfixturevalue(control)
+        else:
+            srv=None
         db = Database(db_path, filename, user, password, charset, debug=str(request.module),
                       config_name=config_name, utf8filename=utf8filename, control=srv)
         if not do_not_create:
