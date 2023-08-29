@@ -64,6 +64,7 @@ from firebird.driver import connect, connect_server, create_database, driver_con
      DbWriteMode, get_api, Error, TIMEOUT
 from firebird.driver.core import _connect_helper
 import socket
+import psutil
 
 Substitutions = List[Tuple[str, str]]
 
@@ -2819,15 +2820,34 @@ class ServerManager:
 
     def _stop(self):
         if self.server_process:
-            if not self.server_process.poll():
-                self.server_process.terminate()
+            pid = self.server_process.pid
+            main_proc = psutil.Process(pid)
+            children = main_proc.children(recursive=True)
+            try:
+                for child in children:
+                    try:
+                        child.terminate()
+                    except psutil.NoSuchProcess:
+                        pass
+                main_proc.terminate()
+            except psutil.NoSuchProcess:
+                pass                
+            try:
+                main_proc.wait(5)
+                for child in children:
+                    child.wait(5)
+                self.server_process = None
+            except TimeoutExpired:
                 try:
-                    self.server_process.wait(timeout=5)
+                    for child in children:
+                        try:
+                            child.kill()
+                        except psutil.NoSuchProcess:
+                            pass
+                    main_proc.kill()
                     self.server_process = None
-                except TimeoutExpired:
-                    self.server_process.kill()
-                    if not self.server_process.poll():
-                        raise Exception("Contolled server has not been stopped (still alive)")
+                except psutil.NoSuchProcess:
+                    pass
         else:
             raise Exception("No controlled server to stop")
                 
