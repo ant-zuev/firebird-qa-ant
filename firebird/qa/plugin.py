@@ -49,7 +49,8 @@ import pytest
 from configparser import ConfigParser, ExtendedInterpolation
 from _pytest.terminal import TerminalReporter, _get_raw_skip_reason, _format_trimmed
 from _pytest.pathlib import bestrelpath
-from subprocess import run, CompletedProcess, PIPE, STDOUT
+from subprocess import run, Popen, CompletedProcess, PIPE, STDOUT, TimeoutExpired
+from _pytest.pathlib import bestrelpath
 from pathlib import Path
 from configparser import ConfigParser, ExtendedInterpolation
 from packaging.specifiers import SpecifierSet
@@ -62,6 +63,7 @@ from firebird.driver import connect, connect_server, create_database, driver_con
      DESCRIPTION_NAME, DESCRIPTION_DISPLAY_SIZE, DatabaseConfig, DBKeyScope, DbInfoCode, \
      DbWriteMode, get_api, Error, TIMEOUT
 from firebird.driver.core import _connect_helper
+import socket
 
 Substitutions = List[Tuple[str, str]]
 
@@ -166,6 +168,7 @@ def pytest_addoption(parser, pluginmanager):
     grp.addoption('--extend-xml', action='store_true', default=False, help="Extend XML JUnit report with additional information")
     grp.addoption('--install-terminal', action='store_true', default=False, help="Use our own terminal reporter")
     grp.addoption('--start-time', action='store_true', dest="start_time_info", default=False, help="Show tests start time info")
+    grp.addoption('--control', dest='control-dir', help="Path to the directory with controlled server files")
 
 def pytest_report_header(config):
     """Returns plugin-specific test session header.
@@ -183,14 +186,20 @@ def pytest_report_header(config):
             f"  client library: {_vars_['fbclient']}",
             ]
 
-def set_tool(tool: str):
+def set_tool(tool: str, control=False):
     "Helper function for `pytest_configure`."
-    path: Path = _vars_['bin-dir'] / tool
+    if control:
+        bindir: Path = _vars_['control-bin']
+        prefix = 'control-'
+    else:
+        bindir = _vars_['bin-dir']
+        prefix = ''
+    path: Path = bindir / tool
     if not path.is_file():
         path = path.with_suffix('.exe')
         if not path.is_file():
             pytest.exit(f"Can't find '{tool}' in {_vars_['bin-dir']}")
-    _vars_[tool] = path
+    _vars_[prefix+tool] = path
 
 def remove_dir(path: Path) -> None:
     if path.exists():
@@ -417,9 +426,30 @@ def pytest_configure(config):
         _vars_['bin-dir'] = Path(bindir) if bindir else _vars_['home-dir']
         _vars_['security-db'] = Path(srv.info.security_database)
         _vars_['arch'] = srv.info.architecture
+    # Controlled server instance
+    if control := config.getoption('control-dir'):
+        controldir: Path = Path(control)
+        if not controldir.is_dir():
+            pytest.exit(f"Can't find contolled server directory {controldir}")
+        _vars_['control-dir']: Path = controldir
+        controlbin = _vars_['control-dir'] / 'bin'
+        if not controlbin.exists():
+            controlbin = _vars_['control-dir']
+        _vars_['control-bin'] = controlbin
+        # Register Firebird server
+        _vars_['control-host'] = "localhost"
+        _vars_['control-port'] = "3051"
+        ctrl_srv_cfg = f"""[control]
+        host = {_vars_['control-host']}
+        port = {_vars_['control-port']}
+        user = {_vars_['user']}
+        password = {_vars_['password']}
+        """
+        driver_config.register_server('control', ctrl_srv_cfg)
     # tools
     for tool in ['isql', 'gbak', 'nbackup', 'gstat', 'gfix', 'gsec', 'fbsvcmgr']:
         set_tool(tool)
+        set_tool(tool, control=True)
     # Load test_config.ini
     QA_GLOBALS.read(_vars_['files'] / 'test_config.ini')
     # Driver encoding for NONE charset
@@ -596,6 +626,7 @@ class Database:
             is taken from server configuration.
         charset: Character set for test database, and also default charset for connections.
         config_name: Name for database configuration.
+        control: Controlled server object.
 
     .. important::
 
@@ -603,7 +634,7 @@ class Database:
     """
     def __init__(self, path: Path, filename: str, user: Optional[str]=None,
                  password: Optional[str]=None, charset: Optional[str]=None, debug: str='',
-                 config_name: str='pytest', utf8filename: bool=False):
+                 config_name: str='pytest', utf8filename: bool=False, control: ServerManager=None):
         #: firebird-driver database configuration name
         self.config_name: str = config_name
         if driver_config.get_database(config_name) is None:
@@ -617,7 +648,15 @@ class Database:
         self.dsn: str = None
         #: Firebird CHARACTER SET name for the database
         self.charset: str = 'NONE' if charset is None else charset.upper()
-        if _vars_['host']:
+        #: Use controlled server instance to connect to database
+        self.control: ServerManager = control
+        self.server_name = _vars_['server']
+        self._tool_prefix = ''
+        if control:
+            self.server_name = 'control'
+            self.dsn = f"{control.host}/{control.port}:{str(self.db_path)}"
+            self._tool_prefix = 'control-'
+        elif _vars_['host']:
             self.dsn = f"{_vars_['host']}:{str(self.db_path)}"
         else:
             self.dsn = str(self.db_path)
@@ -632,7 +671,7 @@ class Database:
                      'backup_location': str(_vars_['root'] / 'backups'),
                      'suite_database_location': str(_vars_['root'] / 'databases'),
                      }
-        srv_conf = driver_config.get_server(_vars_['server'])
+        srv_conf = driver_config.get_server(self.server_name)
         #: User name
         self.user: Optional[str] = srv_conf.user.value if user is None else user
         #: User password
@@ -646,7 +685,7 @@ class Database:
         """
         db_conf = self.get_config()
         db_conf.clear()
-        db_conf.server.value = _vars_['server']
+        db_conf.server.value = self.server_name
         db_conf.database.value = str(self.db_path)
         db_conf.user.value = self.user if user is None else user
         db_conf.password.value = self.password if password is None else password
@@ -761,7 +800,7 @@ class Database:
 
         """
         __tracebackhide__ = True
-        params = [_vars_['isql'], '-user', self.user, '-password', self.password]
+        params = [_vars_[self._tool_prefix+'isql'], '-user', self.user, '-password', self.password]
         if self.charset != 'NONE':
             params.extend(['-ch', self.charset])
             io_enc = CHARSET_MAP[self.charset]
@@ -789,7 +828,7 @@ class Database:
 
         """
         __tracebackhide__ = True
-        with connect_server(_vars_['server']) as srv:
+        with connect_server(self.server_name) as srv:
             srv.database.no_linger(database=self.db_path)
         self._make_config()
         with connect(self.config_name) as db:
@@ -842,12 +881,12 @@ class Database:
     def set_async_write(self) -> None:
         "Set the database to `async write` mode."
         __tracebackhide__ = True
-        with connect_server(_vars_['server']) as srv:
+        with connect_server(self.server_name) as srv:
             srv.database.set_write_mode(database=self.db_path, mode=DbWriteMode.ASYNC)
     def set_sync_write(self) -> None:
         "Set the database to `sync write` mode."
         __tracebackhide__ = True
-        with connect_server(_vars_['server']) as srv:
+        with connect_server(self.server_name) as srv:
             srv.database.set_write_mode(database=self.db_path, mode=DbWriteMode.SYNC)
 
 def db_factory(*, filename: str='test.fdb', init: Optional[str]=None,
@@ -856,7 +895,7 @@ def db_factory(*, filename: str='test.fdb', init: Optional[str]=None,
                charset: Optional[str]=None, user: Optional[str]=None,
                password: Optional[str]=None, do_not_create: bool=False,
                do_not_drop: bool=False, async_write: bool=True,
-               config_name: str='pytest', utf8filename: bool=False):
+               config_name: str='pytest', utf8filename: bool=False, control: str=None):
     """Factory function that returns :doc:`fixture <pytest:explanation/fixtures>` providing
     the `Database` instance.
 
@@ -884,6 +923,7 @@ def db_factory(*, filename: str='test.fdb', init: Optional[str]=None,
         async_write: When `True` [default], the database is set to async write before initialization.
         config_name: Name for database configuration.
         utf8filename: Use utf8filename DPB flag.
+        control: Name of controlled server fixture.
 
     .. note::
 
@@ -894,8 +934,9 @@ def db_factory(*, filename: str='test.fdb', init: Optional[str]=None,
 
     @pytest.fixture
     def database_fixture(request: pytest.FixtureRequest, db_path, db_cache) -> Database:
+        srv: ServerManager = request.getfixturevalue(control)
         db = Database(db_path, filename, user, password, charset, debug=str(request.module),
-                      config_name=config_name, utf8filename=utf8filename)
+                      config_name=config_name, utf8filename=utf8filename, control=srv)
         if not do_not_create:
             if from_backup is None and copy_of is None:
                 db.create(page_size, sql_dialect, db_cache)
@@ -1666,6 +1707,7 @@ class Action:
         self.outfile: Path = outfile
         #: Output from last executed trace session.
         self.trace_log: List[str] = []
+        self._tool_prefix = 'control-' if db.control else ''
     def strip_white(self, value: str) -> str:
         """Remove all leading and trailing whitespace characters on ALL lines in value.
         """
@@ -1734,7 +1776,7 @@ class Action:
         charset = charset.upper() if charset else self.db.charset
         if io_enc is None:
             io_enc = CHARSET_MAP[charset]
-        params = [_vars_['isql'], '-ch', charset]
+        params = [_vars_[self._tool_prefix+'isql'], '-ch', charset]
         if not do_not_connect:
             params.extend(['-user', self.db.user, '-password', self.db.password, str(self.db.dsn)])
         if combine_output:
@@ -1850,7 +1892,7 @@ class Action:
         charset = charset.upper() if charset else self.db.charset
         if io_enc is None:
             io_enc = CHARSET_MAP[charset]
-        params = [_vars_['gstat']]
+        params = [_vars_[self._tool_prefix+'gstat']]
         if credentials:
             params.extend(['-user', self.db.user, '-password', self.db.password])
         params.extend(switches)
@@ -1914,7 +1956,7 @@ class Action:
         charset = charset.upper() if charset else self.db.charset
         if io_enc is None:
             io_enc = CHARSET_MAP[charset]
-        params = [_vars_['gsec']]
+        params = [_vars_[self._tool_prefix+'gsec']]
         if switches is not None:
             params.extend(switches)
         if credentials:
@@ -1976,7 +2018,7 @@ class Action:
         charset = charset.upper() if charset else self.db.charset
         if io_enc is None:
             io_enc = CHARSET_MAP[charset]
-        params = [_vars_['gbak']]
+        params = [_vars_[self._tool_prefix+'gbak']]
         if credentials:
             params.extend(['-user', self.db.user, '-password', self.db.password])
         if switches is not None:
@@ -2040,7 +2082,7 @@ class Action:
         charset = charset.upper() if charset else self.db.charset
         if io_enc is None:
             io_enc = CHARSET_MAP[charset]
-        params = [_vars_['nbackup']]
+        params = [_vars_[self._tool_prefix+'nbackup']]
         params.extend(switches)
         if credentials:
             params.extend(['-user', self.db.user, '-password', self.db.password])
@@ -2103,7 +2145,7 @@ class Action:
         charset = charset.upper() if charset else self.db.charset
         if io_enc is None:
             io_enc = CHARSET_MAP[charset]
-        params = [_vars_['gfix']]
+        params = [_vars_[self._tool_prefix+'gfix']]
         if switches is not None:
             params.extend(switches)
         if credentials:
@@ -2173,7 +2215,7 @@ class Action:
         #
         db = self.db if use_db is None else use_db
         charset = charset.upper() if charset else db.charset
-        params = [_vars_['isql'], '-ch', charset]
+        params = [_vars_[self._tool_prefix+'isql'], '-ch', charset]
         if io_enc is None:
             io_enc = CHARSET_MAP[charset]
         if credentials:
@@ -2246,7 +2288,7 @@ class Action:
         charset = charset.upper() if charset else self.db.charset
         if io_enc is None:
             io_enc = CHARSET_MAP[charset]
-        params = [_vars_['fbsvcmgr']]
+        params = [_vars_[self._tool_prefix+'fbsvcmgr']]
         if connect_mngr:
             params.extend([f"{_vars_['host']}:service_mgr" if _vars_['host'] else 'service_mgr',
                            'user', self.db.user, 'password', self.db.password])
@@ -2292,7 +2334,7 @@ class Action:
                 password = user.password
         if isinstance(role, Role):
             role = role.name
-        return connect_server(_vars_['server'],
+        return connect_server(self.db.server_name,
                               user=_vars_['user'] if user is None else user,
                               password=_vars_['password'] if password is None else password,
                               role=role, encoding=encoding, encoding_errors=encoding_errors)
@@ -2675,4 +2717,140 @@ def temp_files(filenames: List[Union[str, Path]]):
                 tmp_file.unlink()
 
     return temp_files_fixture
+
+class ConfigManager:
+    """Object to store and replace server configuration files.
+
+    Arguments:
+        tmp_path: Path to directory where backup will be stored.
+        control: Store configs for controlled server instance.
+
+    .. important::
+
+        Do not create instances of this class directly! Use **only** fixtures created by `store_config`.
+    """
+
+    def __init__(self, tmp_path: Path, control: bool= False):
+        self.__old_configs = {}
+        self.__bak_configs = []
+        root_dir: Path = _vars_['control-dir'] if control else _vars_['home-dir']
+        for old_config in root_dir.glob('*.conf'):
+            self.__old_configs[old_config.name] = old_config
+            backup = tmp_path / (old_config.name + '.bak')    
+            if backup.exists():
+                backup.unlink()
+            shutil.copy(str(old_config), str(backup))
+            self.__bak_configs.append(backup)
+
+    def replace(self, old_config_name: str, new_config: Path):
+        """
+            old_config_name: replaced config filename
+            new_config: Path to new config
+        """
+        shutil.copy(str(new_config), str(self.__old_configs[old_config_name]))
+
+    def add(self, old_config_name: str, new_config: Path):
+        """
+            old_config_name: supplemented config filename
+            new_config: Path to new config
+        """
+        new_content = new_config.read_text()
+        with open(self.__old_configs[old_config_name], 'a') as old:
+            old.write(new_content)
+
+    def restore(self, final=False):
+        for backup in self.__bak_configs:
+            shutil.copy(str(backup), str(self.__old_configs[backup.stem]))
+            if final:
+                backup.unlink()
+
+@pytest.fixture
+def store_config(db_path) -> ConfigManager:
+    manager = ConfigManager(db_path)
+    yield manager
+    manager.restore(final=True)
+
+class ServerManager:
+    """Object to start additional controlled server instance.
+
+    Arguments:
+        cfg_manager: ConfigManager
+
+    .. important::
+
+        Do not create instances of this class directly! Use **only** fixtures created by `server_factory`.
+    """
+
+    def __init__(self, cfg_manager: ConfigManager = None):
+        self.host = _vars_['control-host']
+        self.port = _vars_['control-port']
+        self.config = cfg_manager
+        self.home_dir = _vars_['control-dir']
+        bindir = self.home_dir / 'bin'
+        if not bindir.exists():
+            bindir = self.home_dir
+        self.bin_dir = bindir
+        self._set_server()
+        self.server_process = None
+        self._start()
+
+    def restart(self):
+        self._stop()
+        self._start()
+
+    def _start(self, timeout=10):
+        if not self.server_process:
+            self.server_process = Popen([self.server.resolve(), '-a', '-p', self.port])
+            conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            targetIP = socket.gethostbyname(self.host)
+            while timeout > 0:
+                result: socket = conn.connect_ex((targetIP, int(self.port)))
+                if not result:
+                    return
+                time.sleep(1)
+                timeout -= 1
+            raise Exception("Controlled server starting timout")
+        else:
+            raise Exception("Controlled server has been already started")
+
+    def _stop(self):
+        if self.server_process:
+            if not self.server_process.poll():
+                self.server_process.terminate()
+                try:
+                    self.server_process.wait(timeout=5)
+                    self.server_process = None
+                except TimeoutExpired:
+                    self.server_process.kill()
+                    if not self.server_process.poll():
+                        raise Exception("Contolled server has not been stopped (still alive)")
+        else:
+            raise Exception("No controlled server to stop")
+                
+    def _set_server(self):
+        path: Path = self.bin_dir / 'firebird'
+        if not path.is_file():
+            path = path.with_suffix('.exe')
+            if not path.is_file():
+                pytest.fail(f"Can't find firebird in contolled instance directory {self.bin_dir}")
+        self.server = path
+
+def server_factory():
+    """Factory function that returns :doc:`fixture <pytest:explanation/fixtures>` providing
+    the `ServerManager` instance.
+   
+    .. note::
+
+       Dont use this factory to backup and replace configs reread only after server restart (e.g. firebird.conf).
+    """
+
+    @pytest.fixture
+    def controlled_server_fixture(db_path) -> ServerManager:
+        manager = ConfigManager(db_path, control=True)
+        server: ServerManager = ServerManager(cfg_manager=manager)
+        yield server
+        server._stop()
+        manager.restore()
+
+    return controlled_server_fixture
 
